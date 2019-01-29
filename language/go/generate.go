@@ -415,7 +415,9 @@ func (g *generator) generateProto(mode proto.Mode, target protoTarget, importPat
 	goProtoLibrary.SetAttr("proto", ":"+protoName)
 	g.setImportAttrs(goProtoLibrary, importPath)
 	if target.hasServices {
-		goProtoLibrary.SetAttr("compilers", []string{"@io_bazel_rules_go//proto:go_grpc"})
+		goProtoLibrary.SetAttr("compilers", []string{"@io_bazel_rules_go//proto:gogoslick_grpc", "//:go_yarpc"})
+	} else {
+		goProtoLibrary.SetAttr("compilers", []string{"@io_bazel_rules_go//proto:gogoslick_grpc"})
 	}
 	if g.shouldSetVisibility {
 		goProtoLibrary.SetAttr("visibility", visibility)
