@@ -126,6 +126,17 @@ func (x *Ident) Span() (start, end Position) {
 	return x.NamePos, x.NamePos.add(x.Name)
 }
 
+// BranchStmt represents a `pass` statement.
+type BranchStmt struct {
+	Comments
+	Token    string // pass, break, continue
+	TokenPos Position
+}
+
+func (x *BranchStmt) Span() (start, end Position) {
+	return x.TokenPos, x.TokenPos.add(x.Token)
+}
+
 func (x *Ident) asString() *StringExpr {
 	_, end := x.Span()
 	return &StringExpr{
@@ -347,6 +358,22 @@ type BinaryExpr struct {
 func (x *BinaryExpr) Span() (start, end Position) {
 	start, _ = x.X.Span()
 	_, end = x.Y.Span()
+	return start, end
+}
+
+// An AssignExpr represents a binary expression with `=`: LHS = RHS.
+type AssignExpr struct {
+	Comments
+	LHS       Expr
+	OpPos     Position
+	Op        string
+	LineBreak bool // insert line break between Op and RHS
+	RHS       Expr
+}
+
+func (x *AssignExpr) Span() (start, end Position) {
+	start, _ = x.LHS.Span()
+	_, end = x.RHS.Span()
 	return start, end
 }
 

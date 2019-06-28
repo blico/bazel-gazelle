@@ -4,6 +4,7 @@ go_library(
     name = "go_default_library",
     srcs = [
         "dep.go",
+        "godep.go",
         "modules.go",
         "remote.go",
         "repo.go",
@@ -12,6 +13,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//label:go_default_library",
+        "//merger:go_default_library",
         "//pathtools:go_default_library",
         "//rule:go_default_library",
         "//vendor/github.com/pelletier/go-toml:go_default_library",
@@ -23,13 +25,15 @@ go_test(
     name = "go_default_test",
     srcs = [
         "import_test.go",
-        "modules_test.go",
         "remote_test.go",
         "repo_test.go",
+        "stubs_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
+        "//pathtools:go_default_library",
         "//rule:go_default_library",
+        "//testtools:go_default_library",
         "//vendor/golang.org/x/tools/go/vcs:go_default_library",
     ],
 )

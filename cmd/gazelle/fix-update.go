@@ -146,6 +146,10 @@ type visitRecord struct {
 
 	// file is the build file being processed.
 	file *rule.File
+
+	// mappedKinds are mapped kinds used during this visit.
+	mappedKinds    []config.MappedKind
+	mappedKindInfo map[string]rule.KindInfo
 }
 
 type byPkgRel []visitRecord
@@ -168,18 +172,18 @@ func runFixUpdate(cmd command, args []string) error {
 		&updateConfigurer{},
 		&walk.Configurer{},
 		&resolve.Configurer{})
-	kindToResolver := make(map[string]resolve.Resolver)
+	mrslv := newMetaResolver()
 	kinds := make(map[string]rule.KindInfo)
 	loads := genericLoads
 	for _, lang := range languages {
 		cexts = append(cexts, lang)
 		for kind, info := range lang.Kinds() {
-			kindToResolver[kind] = lang
+			mrslv.AddBuiltin(kind, lang)
 			kinds[kind] = info
 		}
 		loads = append(loads, lang.Loads()...)
 	}
-	ruleIndex := resolve.NewRuleIndex(kindToResolver)
+	ruleIndex := resolve.NewRuleIndex(mrslv.Resolver)
 
 	c, err := newFixUpdateConfiguration(cmd, args, cexts, loads)
 	if err != nil {
@@ -240,6 +244,20 @@ func runFixUpdate(cmd command, args []string) error {
 			return
 		}
 
+		// Apply and record relevant kind mappings.
+		var (
+			mappedKinds    []config.MappedKind
+			mappedKindInfo = make(map[string]rule.KindInfo)
+		)
+		for _, r := range gen {
+			if repl, ok := c.KindMap[r.Kind()]; ok {
+				mappedKindInfo[repl.KindName] = kinds[r.Kind()]
+				mappedKinds = append(mappedKinds, repl)
+				mrslv.MappedKind(rel, repl)
+				r.SetKind(repl.KindName)
+			}
+		}
+
 		// Insert or merge rules into the build file.
 		if f == nil {
 			f = rule.EmptyFile(filepath.Join(dir, c.DefaultBuildFileName()), rel)
@@ -247,15 +265,18 @@ func runFixUpdate(cmd command, args []string) error {
 				r.Insert(f)
 			}
 		} else {
-			merger.MergeFile(f, empty, gen, merger.PreResolve, kinds)
+			merger.MergeFile(f, empty, gen, merger.PreResolve,
+				unionKindInfoMaps(kinds, mappedKindInfo))
 		}
 		visits = append(visits, visitRecord{
-			pkgRel:  rel,
-			c:       c,
-			rules:   gen,
-			imports: imports,
-			empty:   empty,
-			file:    f,
+			pkgRel:         rel,
+			c:              c,
+			rules:          gen,
+			imports:        imports,
+			empty:          empty,
+			file:           f,
+			mappedKinds:    mappedKinds,
+			mappedKindInfo: mappedKindInfo,
 		})
 
 		// Add library rules to the dependency resolution table.
@@ -270,19 +291,21 @@ func runFixUpdate(cmd command, args []string) error {
 	ruleIndex.Finish()
 
 	// Resolve dependencies.
-	rc := repo.NewRemoteCache(uc.repos)
+	rc, cleanupRc := repo.NewRemoteCache(uc.repos)
+	defer cleanupRc()
 	for _, v := range visits {
 		for i, r := range v.rules {
 			from := label.New(c.RepoName, v.pkgRel, r.Name())
-			kindToResolver[r.Kind()].Resolve(v.c, ruleIndex, rc, r, v.imports[i], from)
+			mrslv.Resolver(r, v.pkgRel).Resolve(v.c, ruleIndex, rc, r, v.imports[i], from)
 		}
-		merger.MergeFile(v.file, v.empty, v.rules, merger.PostResolve, kinds)
+		merger.MergeFile(v.file, v.empty, v.rules, merger.PostResolve,
+			unionKindInfoMaps(kinds, v.mappedKindInfo))
 	}
 
 	// Emit merged files.
 	var exit error
 	for _, v := range visits {
-		merger.FixLoads(v.file, loads)
+		merger.FixLoads(v.file, applyKindMappings(v.mappedKinds, loads))
 		if err := uc.emit(v.c, v.file); err != nil {
 			if err == exitError {
 				exit = err
@@ -337,11 +360,23 @@ func newFixUpdateConfiguration(cmd command, args []string, cexts []config.Config
 			return nil, err
 		}
 	} else {
-		if err := fixWorkspace(c, workspace, loads); err != nil {
+		c.RepoName = findWorkspaceName(workspace)
+		var reposFiles map[*rule.File][]string
+		uc.repos, reposFiles, err = repo.ListRepositories(workspace)
+		if err != nil {
 			return nil, err
 		}
-		c.RepoName = findWorkspaceName(workspace)
-		uc.repos = repo.ListRepositories(workspace)
+		files := make([]*rule.File, 0, len(reposFiles))
+		seen := make(map[string]bool)
+		for f := range reposFiles {
+			if !seen[f.Path] {
+				files = append(files, f)
+				seen[f.Path] = true
+			}
+		}
+		if err := fixRepoFiles(c, files, loads); err != nil {
+			return nil, err
+		}
 	}
 	repoPrefixes := make(map[string]bool)
 	for _, r := range uc.repos {
@@ -390,7 +425,7 @@ FLAGS:
 	fs.PrintDefaults()
 }
 
-func fixWorkspace(c *config.Config, workspace *rule.File, loads []rule.LoadInfo) error {
+func fixRepoFiles(c *config.Config, files []*rule.File, loads []rule.LoadInfo) error {
 	uc := getUpdateConfig(c)
 	if !c.ShouldFix {
 		return nil
@@ -405,12 +440,19 @@ func fixWorkspace(c *config.Config, workspace *rule.File, loads []rule.LoadInfo)
 		return nil
 	}
 
-	merger.FixWorkspace(workspace)
-	merger.FixLoads(workspace, loads)
-	if err := merger.CheckGazelleLoaded(workspace); err != nil {
-		return err
+	for _, f := range files {
+		merger.FixLoads(f, loads)
+		if f.Path == filepath.Join(c.RepoRoot, "WORKSPACE") {
+			merger.FixWorkspace(f)
+			if err := merger.CheckGazelleLoaded(f); err != nil {
+				return err
+			}
+		}
+		if err := uc.emit(c, f); err != nil {
+			return err
+		}
 	}
-	return uc.emit(c, workspace)
+	return nil
 }
 
 func findWorkspaceName(f *rule.File) string {
@@ -453,4 +495,52 @@ func findOutputPath(c *config.Config, f *rule.File) string {
 		return defaultOutputPath
 	}
 	return outputPath
+}
+
+func unionKindInfoMaps(a, b map[string]rule.KindInfo) map[string]rule.KindInfo {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	result := make(map[string]rule.KindInfo, len(a)+len(b))
+	for _, m := range []map[string]rule.KindInfo{a, b} {
+		for k, v := range m {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// applyKindMappings returns a copy of LoadInfo that includes c.KindMap.
+func applyKindMappings(mappedKinds []config.MappedKind, loads []rule.LoadInfo) []rule.LoadInfo {
+	if len(mappedKinds) == 0 {
+		return loads
+	}
+
+	// Add new RuleInfos or replace existing ones with merged ones.
+	mappedLoads := make([]rule.LoadInfo, len(loads))
+	copy(mappedLoads, loads)
+	for _, mappedKind := range mappedKinds {
+		mappedLoads = appendOrMergeKindMapping(mappedLoads, mappedKind)
+	}
+	return mappedLoads
+}
+
+// appendOrMergeKindMapping adds LoadInfo for the given replacement.
+func appendOrMergeKindMapping(mappedLoads []rule.LoadInfo, mappedKind config.MappedKind) []rule.LoadInfo {
+	// If mappedKind.KindLoad already exists in the list, create a merged copy.
+	for _, load := range mappedLoads {
+		if load.Name == mappedKind.KindLoad {
+			load.Symbols = append(load.Symbols, mappedKind.KindName)
+			return mappedLoads
+		}
+	}
+
+	// Add a new LoadInfo.
+	return append(mappedLoads, rule.LoadInfo{
+		Name:    mappedKind.KindLoad,
+		Symbols: []string{mappedKind.KindName},
+	})
 }

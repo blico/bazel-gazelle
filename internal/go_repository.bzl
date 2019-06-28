@@ -18,9 +18,11 @@ load("@io_bazel_rules_go//go/private:common.bzl", "env_execute", "executable_ext
 _GO_REPOSITORY_TIMEOUT = 86400
 
 def _go_repository_impl(ctx):
+    fetch_repo_args = None
+
     if ctx.attr.urls:
-        # download from explicit source url
-        for key in ("commit", "tag", "vcs", "remote"):
+        # HTTP mode
+        for key in ("commit", "tag", "vcs", "remote", "version", "sum", "replace"):
             if getattr(ctx.attr, key):
                 fail("cannot specifiy both urls and %s" % key, key)
         ctx.download_and_extract(
@@ -29,54 +31,45 @@ def _go_repository_impl(ctx):
             stripPrefix = ctx.attr.strip_prefix,
             type = ctx.attr.type,
         )
-    else:
-        # checkout from vcs
-        if ctx.attr.commit and ctx.attr.tag:
-            fail("cannot specify both of commit and tag", "commit")
+    elif ctx.attr.commit or ctx.attr.tag:
+        # repository mode
         if ctx.attr.commit:
             rev = ctx.attr.commit
             rev_key = "commit"
         elif ctx.attr.tag:
             rev = ctx.attr.tag
             rev_key = "tag"
-        else:
-            fail("neither commit or tag is specified", "commit")
-        for key in ("urls", "strip_prefix", "type", "sha256"):
+        for key in ("urls", "strip_prefix", "type", "sha256", "version", "sum", "replace"):
             if getattr(ctx.attr, key):
                 fail("cannot specify both %s and %s" % (rev_key, key), key)
 
-        # Using fetch repo
         if ctx.attr.vcs and not ctx.attr.remote:
             fail("if vcs is specified, remote must also be")
 
-        env_keys = [
-            "PATH",
-            "HOME",
-            "SSH_AUTH_SOCK",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-            "GIT_SSL_CAINFO",
-        ]
-        fetch_repo_env = {k: ctx.os.environ[k] for k in env_keys if k in ctx.os.environ}
-
-        _fetch_repo = "@bazel_gazelle_go_repository_tools//:bin/fetch_repo{}".format(executable_extension(ctx))
-        args = [
-            ctx.path(Label(_fetch_repo)),
-            "--dest",
-            ctx.path(""),
-        ]
+        fetch_repo_args = ["-dest", ctx.path(""), "-importpath", ctx.attr.importpath]
         if ctx.attr.remote:
-            args.extend(["--remote", ctx.attr.remote])
+            fetch_repo_args.extend(["--remote", ctx.attr.remote])
         if rev:
-            args.extend(["--rev", rev])
+            fetch_repo_args.extend(["--rev", rev])
         if ctx.attr.vcs:
-            args.extend(["--vcs", ctx.attr.vcs])
-        if ctx.attr.importpath:
-            args.extend(["--importpath", ctx.attr.importpath])
-        result = env_execute(ctx, args, environment = fetch_repo_env, timeout = _GO_REPOSITORY_TIMEOUT)
-        if result.return_code:
-            fail("failed to fetch %s: %s" % (ctx.name, result.stderr))
+            fetch_repo_args.extend(["--vcs", ctx.attr.vcs])
+    elif ctx.attr.version:
+        # module mode
+        for key in ("urls", "strip_prefix", "type", "sha256", "commit", "tag", "vcs", "remote"):
+            if getattr(ctx.attr, key):
+                fail("cannot specify both version and %s", key)
+        if not ctx.attr.sum:
+            fail("if version is specified, sum must also be")
+
+        fetch_path = ctx.attr.replace if ctx.attr.replace else ctx.attr.importpath
+        fetch_repo_args = [
+            "-dest=" + str(ctx.path("")),
+            "-importpath=" + fetch_path,
+            "-version=" + ctx.attr.version,
+            "-sum=" + ctx.attr.sum,
+        ]
+    else:
+        fail("one of urls, commit, tag, or importpath must be specified")
 
     generate = ctx.attr.build_file_generation == "on"
     if ctx.attr.build_file_generation == "auto":
@@ -86,30 +79,60 @@ def _go_repository_impl(ctx):
             if path.exists and not env_execute(ctx, ["test", "-f", path]).return_code:
                 generate = False
                 break
+    if fetch_repo_args or generate:
+        env = _read_cache_env(ctx, str(ctx.path(Label("@bazel_gazelle_go_repository_cache//:go.env"))))
+        env_keys = [
+            "GOPROXY",
+            "PATH",
+            "HOME",
+            "SSH_AUTH_SOCK",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "GIT_SSL_CAINFO",
+        ]
+        env.update({k: ctx.os.environ[k] for k in env_keys if k in ctx.os.environ})
+
+    if fetch_repo_args:
+        fetch_repo = str(ctx.path(Label("@bazel_gazelle_go_repository_tools//:bin/fetch_repo{}".format(executable_extension(ctx)))))
+        result = env_execute(
+            ctx,
+            [fetch_repo] + fetch_repo_args,
+            environment = env,
+            timeout = _GO_REPOSITORY_TIMEOUT,
+        )
+        if result.return_code:
+            fail("failed to fetch %s: %s" % (ctx.name, result.stderr))
+
     if generate:
         # Build file generation is needed
         _gazelle = "@bazel_gazelle_go_repository_tools//:bin/gazelle{}".format(executable_extension(ctx))
         gazelle = ctx.path(Label(_gazelle))
         cmd = [
             gazelle,
-            "--go_prefix",
+            "-go_prefix",
             ctx.attr.importpath,
-            "--mode",
+            "-mode",
             "fix",
-            "--repo_root",
+            "-repo_root",
             ctx.path(""),
         ]
+        if ctx.attr.version:
+            cmd.append("-go_experimental_module_mode")
         if ctx.attr.build_file_name:
-            cmd.extend(["--build_file_name", ctx.attr.build_file_name])
+            cmd.extend(["-build_file_name", ctx.attr.build_file_name])
         if ctx.attr.build_tags:
-            cmd.extend(["--build_tags", ",".join(ctx.attr.build_tags)])
+            cmd.extend(["-build_tags", ",".join(ctx.attr.build_tags)])
         if ctx.attr.build_external:
-            cmd.extend(["--external", ctx.attr.build_external])
+            cmd.extend(["-external", ctx.attr.build_external])
         if ctx.attr.build_file_proto_mode:
-            cmd.extend(["--proto", ctx.attr.build_file_proto_mode])
+            cmd.extend(["-proto", ctx.attr.build_file_proto_mode])
         cmd.extend(ctx.attr.build_extra_args)
         cmd.append(ctx.path(""))
-        result = env_execute(ctx, cmd)
+        result = env_execute(ctx, cmd, environment = env, timeout = _GO_REPOSITORY_TIMEOUT)
         if result.return_code:
             fail("failed to generate BUILD files for %s: %s" % (
                 ctx.attr.importpath,
@@ -140,11 +163,16 @@ go_repository = repository_rule(
         ),
         "remote": attr.string(),
 
-        # Attributes for a repository that comes from a source blob not a vcs
+        # Attributes for a repository that should be downloaded via HTTP.
         "urls": attr.string_list(),
         "strip_prefix": attr.string(),
         "type": attr.string(),
         "sha256": attr.string(),
+
+        # Attributes for a module that should be downloaded with the Go toolchain.
+        "version": attr.string(),
+        "sum": attr.string(),
+        "replace": attr.string(),
 
         # Attributes for a repository that needs automatic build file generation
         "build_external": attr.string(
@@ -208,6 +236,46 @@ def patch(ctx):
             fail("Error applying patch command %s:\n%s%s" %
                  (cmd, st.stdout, st.stderr))
 
+def _go_repository_cache_impl(ctx):
+    env_tpl = """
+GOROOT={goroot}
+GOPATH={gopath}
+GOCACHE={gocache}
+"""
+    env_content = env_tpl.format(
+        goroot = str(ctx.path(ctx.attr.go_sdk).dirname),
+        gopath = str(ctx.path(".")),
+        gocache = str(ctx.path("gocache")),
+    )
+    ctx.file("go.env", env_content)
+    ctx.file("BUILD.bazel", 'exports_files(["go.env"])')
+
+go_repository_cache = repository_rule(
+    _go_repository_cache_impl,
+    attrs = {
+        "go_sdk": attr.label(
+            default = "@go_sdk//:ROOT",
+            allow_single_file = True,
+        ),
+    },
+)
+
+def _read_cache_env(ctx, path):
+    result = ctx.execute(["cat", path])
+    if result.return_code:
+        fail("failed to read cache environment: " + result.stderr)
+    env = {}
+    lines = result.stdout.split("\n")
+    for line in lines:
+        line = line.strip()
+        if line == "" or line.startswith("#"):
+            continue
+        k, sep, v = line.partition("=")
+        if sep == "":
+            fail("failed to parse cache environment")
+        env[k] = v
+    return env
+
 _GO_REPOSITORY_TOOLS_BUILD_FILE = """
 package(default_visibility = ["//visibility:public"])
 
@@ -220,50 +288,63 @@ filegroup(
     name = "gazelle",
     srcs = ["bin/gazelle{extension}"],
 )
+
+exports_files(["ROOT"])
 """
 
 def _go_repository_tools_impl(ctx):
+    # Create a link to the gazelle repo. This will be our GOPATH.
+    env = _read_cache_env(ctx, str(ctx.path(ctx.attr.go_cache)))
     extension = executable_extension(ctx)
-    go_root = ctx.path(ctx.attr.go_sdk).dirname
-    go_tool = str(go_root) + "/bin/go" + extension
+    go_tool = env["GOROOT"] + "/bin/go" + extension
 
-    for root_file, prefix in ctx.attr._deps.items():
-        ctx.symlink(ctx.path(root_file).dirname, "src/" + prefix)
+    ctx.symlink(
+        ctx.path(Label("@bazel_gazelle//:WORKSPACE")).dirname,
+        "src/github.com/bazelbuild/bazel-gazelle",
+    )
 
-    env = {
-        "GOROOT": str(go_root),
+    # Resolve a label for each source file so this rule will be re-executed
+    # when they change.
+    list_script = str(ctx.path(Label("@bazel_gazelle//internal:list_repository_tools_srcs.go")))
+    result = ctx.execute([go_tool, "run", list_script])
+    if result.return_code:
+        print("could not resolve gazelle sources: " + result.stderr)
+    else:
+        for line in result.stdout.split("\n"):
+            line = line.strip()
+            if line == "":
+                continue
+            ctx.path(Label(line))
+
+    # Build the tools.
+    env.update({
         "GOPATH": str(ctx.path(".")),
         "GO111MODULE": "off",
-        # GOCACHE is required starting in Go 1.12
-        "GOCACHE": str(ctx.path(".")) + "/.gocache",
         # workaround: to find gcc for go link tool on Arm platform
         "PATH": ctx.os.environ["PATH"],
         # workaround: avoid the Go SDK paths from leaking into the binary
         "GOROOT_FINAL": "GOROOT",
         # workaround: avoid cgo paths in /tmp leaking into binary
         "CGO_ENABLED": "0",
-    }
+    })
+    if "GOPROXY" in ctx.os.environ:
+        env["GOPROXY"] = ctx.os.environ["GOPROXY"]
 
-    for tool in ("fetch_repo", "gazelle"):
-        args = [
-            go_tool,
-            "install",
-            "-a",
-            "-ldflags",
-            "-w -s",
-            "-gcflags",
-            "all=-trimpath=" + env["GOPATH"],
-            "-asmflags",
-            "all=-trimpath=" + env["GOPATH"],
-            "github.com/bazelbuild/bazel-gazelle/cmd/{}".format(tool),
-        ]
-        result = env_execute(ctx, args, environment = env)
-        if result.return_code:
-            fail("failed to build {}: {}".format(tool, result.stderr))
-
-    result = ctx.execute(["rm", "-rf", ".gocache"])
+    args = [
+        go_tool,
+        "install",
+        "-ldflags",
+        "-w -s",
+        "-gcflags",
+        "all=-trimpath=" + env["GOPATH"],
+        "-asmflags",
+        "all=-trimpath=" + env["GOPATH"],
+        "github.com/bazelbuild/bazel-gazelle/cmd/gazelle",
+        "github.com/bazelbuild/bazel-gazelle/cmd/fetch_repo",
+    ]
+    result = env_execute(ctx, args, environment = env)
     if result.return_code:
-        print("failed to remove GOCACHE: {}".format(result.stderr))
+        fail("failed to build tools: " + result.stderr)
 
     # add a build file to export the tools
     ctx.file(
@@ -271,18 +352,18 @@ def _go_repository_tools_impl(ctx):
         _GO_REPOSITORY_TOOLS_BUILD_FILE.format(extension = executable_extension(ctx)),
         False,
     )
+    ctx.file(
+        "ROOT",
+        "",
+        False,
+    )
 
 go_repository_tools = repository_rule(
     _go_repository_tools_impl,
     attrs = {
-        "go_sdk": attr.label(
-            default = "@go_sdk//:ROOT",
+        "go_cache": attr.label(
+            mandatory = True,
             allow_single_file = True,
-        ),
-        "_deps": attr.label_keyed_string_dict(
-            default = {
-                "@bazel_gazelle//:WORKSPACE": "github.com/bazelbuild/bazel-gazelle",
-            },
         ),
     },
     environ = ["TMP"],

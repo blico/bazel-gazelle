@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/bazelbuild/bazel-gazelle/label"
+	"github.com/bazelbuild/bazel-gazelle/pathtools"
 	"github.com/bazelbuild/bazel-gazelle/repo"
 	"github.com/bazelbuild/bazel-gazelle/resolve"
 	"github.com/bazelbuild/bazel-gazelle/rule"
@@ -34,10 +35,10 @@ func TestResolveGo(t *testing.T) {
 		rel, content string
 	}
 	type testCase struct {
-		desc  string
-		index []buildFile
-		old   buildFile
-		want  string
+		desc      string
+		index     []buildFile
+		old       buildFile
+		want      string
 		skipIndex bool
 	}
 	for _, tc := range []testCase{
@@ -433,7 +434,7 @@ go_library(
         "github.com/bazelbuild/bazel-gazelle/language",
         "github.com/bazelbuild/rules_go/go/tools/bazel",
     ],
-)        
+)
 `},
 			want: `
 go_library(
@@ -445,7 +446,7 @@ go_library(
 )
 `,
 		}, {
-			desc: "local_unknown",
+			desc:      "local_unknown",
 			skipIndex: true,
 			old: buildFile{content: `
 go_binary(
@@ -808,6 +809,7 @@ go_library(
 go_library(
     name = "go_default_library",
     _imports = [
+        "github.com/golang/protobuf/proto",
         "github.com/golang/protobuf/jsonpb",
         "github.com/golang/protobuf/descriptor",
         "github.com/golang/protobuf/protoc-gen-go/generator",
@@ -822,6 +824,7 @@ go_library(
     deps = [
         "@com_github_golang_protobuf//descriptor:go_default_library_gen",
         "@com_github_golang_protobuf//jsonpb:go_default_library_gen",
+        "@com_github_golang_protobuf//proto:go_default_library",
         "@com_github_golang_protobuf//protoc-gen-go/generator:go_default_library_gen",
         "@com_github_golang_protobuf//ptypes:go_default_library_gen",
         "@org_golang_google_grpc//:go_default_library",
@@ -873,6 +876,48 @@ go_library(
     importpath = "foo",
 )
 `,
+		}, {
+			desc: "proto_import_prefix_and_strip_import_prefix",
+			index: []buildFile{{
+				rel: "",
+				content: `
+# gazelle:proto_strip_import_prefix /sub
+# gazelle:proto_import_prefix foo/
+`,
+			}, {
+				rel: "sub",
+				content: `
+proto_library(
+    name = "foo_proto",
+    srcs = ["bar.proto"],
+)
+
+go_proto_library(
+    name = "foo_go_proto",
+    importpath = "example.com/foo",
+    proto = ":foo_proto",
+)
+
+go_library(
+    name = "embed",
+    embed = [":foo_go_proto"],
+    importpath = "example.com/foo",
+)
+`,
+			},
+			},
+			old: buildFile{content: `
+go_proto_library(
+    name = "dep_proto",
+    _imports = ["foo/bar.proto"],
+)
+`},
+			want: `
+go_proto_library(
+    name = "dep_proto",
+    deps = ["//sub:embed"],
+)
+`,
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -880,13 +925,13 @@ go_library(
 				t,
 				"-go_prefix=example.com/repo/resolve",
 				"-external=vendored", fmt.Sprintf("-index=%v", !tc.skipIndex))
-			kindToResolver := make(map[string]resolve.Resolver)
+			mrslv := make(mapResolver)
 			for _, lang := range langs {
 				for kind := range lang.Kinds() {
-					kindToResolver[kind] = lang
+					mrslv[kind] = lang
 				}
 			}
-			ix := resolve.NewRuleIndex(kindToResolver)
+			ix := resolve.NewRuleIndex(mrslv.Resolver)
 			rc := testRemoteCache(nil)
 
 			for _, bf := range tc.index {
@@ -916,7 +961,7 @@ go_library(
 			}
 			ix.Finish()
 			for i, r := range f.Rules {
-				kindToResolver[r.Kind()].Resolve(c, ix, rc, r, imports[i], label.New("", tc.old.rel, r.Name()))
+				mrslv.Resolver(r, "").Resolve(c, ix, rc, r, imports[i], label.New("", tc.old.rel, r.Name()))
 			}
 			f.Sync()
 			got := strings.TrimSpace(string(bzl.Format(f.File)))
@@ -1016,12 +1061,14 @@ func TestResolveExternal(t *testing.T) {
 	c, langs, _ := testConfig(
 		t,
 		"-go_prefix=example.com/local")
+	gc := getGoConfig(c)
 	ix := resolve.NewRuleIndex(nil)
 	ix.Finish()
 	gl := langs[1].(*goLang)
 	for _, tc := range []struct {
 		desc, importpath string
 		repos            []repo.Repo
+		moduleMode       bool
 		want             string
 	}{
 		{
@@ -1049,16 +1096,31 @@ func TestResolveExternal(t *testing.T) {
 			importpath: "example.com/lib",
 			want:       "@com_example//lib:go_default_library",
 		}, {
-			desc: "same_prefix",
+			desc:       "same_prefix",
 			importpath: "example.com/local/ext",
 			repos: []repo.Repo{{
-				Name: "local_ext",
+				Name:     "local_ext",
 				GoPrefix: "example.com/local/ext",
 			}},
 			want: "@local_ext//:go_default_library",
+		}, {
+			desc:       "module_mode_unknown",
+			importpath: "example.com/repo/v2/foo",
+			moduleMode: true,
+			want:       "@com_example_repo_v2//foo:go_default_library",
+		}, {
+			desc:       "module_mode_known",
+			importpath: "example.com/repo/v2/foo",
+			repos: []repo.Repo{{
+				Name:     "custom_repo",
+				GoPrefix: "example.com/repo",
+			}},
+			moduleMode: true,
+			want:       "@custom_repo//v2/foo:go_default_library",
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
+			gc.moduleMode = tc.moduleMode
 			rc := testRemoteCache(tc.repos)
 			r := rule.NewRule("go_library", "x")
 			imports := rule.PlatformStrings{Generic: []string{tc.importpath}}
@@ -1075,17 +1137,18 @@ func TestResolveExternal(t *testing.T) {
 }
 
 func testRemoteCache(knownRepos []repo.Repo) *repo.RemoteCache {
-	rc := repo.NewRemoteCache(knownRepos)
+	rc, _ := repo.NewRemoteCache(knownRepos)
 	rc.RepoRootForImportPath = stubRepoRootForImportPath
-	rc.HeadCmd = func(remote, vcs string) (string, error) {
+	rc.HeadCmd = func(_, _ string) (string, error) {
 		return "", fmt.Errorf("HeadCmd not supported in test")
 	}
+	rc.ModInfo = stubModInfo
 	return rc
 }
 
 // stubRepoRootForImportPath is a stub implementation of vcs.RepoRootForImportPath
-func stubRepoRootForImportPath(importpath string, verbose bool) (*vcs.RepoRoot, error) {
-	if strings.HasPrefix(importpath, "example.com/repo.git") {
+func stubRepoRootForImportPath(importPath string, verbose bool) (*vcs.RepoRoot, error) {
+	if pathtools.HasPrefix(importPath, "example.com/repo.git") {
 		return &vcs.RepoRoot{
 			VCS:  vcs.ByCmd("git"),
 			Repo: "https://example.com/repo.git",
@@ -1093,7 +1156,7 @@ func stubRepoRootForImportPath(importpath string, verbose bool) (*vcs.RepoRoot, 
 		}, nil
 	}
 
-	if strings.HasPrefix(importpath, "example.com/repo") {
+	if pathtools.HasPrefix(importPath, "example.com/repo") {
 		return &vcs.RepoRoot{
 			VCS:  vcs.ByCmd("git"),
 			Repo: "https://example.com/repo.git",
@@ -1101,7 +1164,7 @@ func stubRepoRootForImportPath(importpath string, verbose bool) (*vcs.RepoRoot, 
 		}, nil
 	}
 
-	if strings.HasPrefix(importpath, "example.com") {
+	if pathtools.HasPrefix(importPath, "example.com") {
 		return &vcs.RepoRoot{
 			VCS:  vcs.ByCmd("git"),
 			Repo: "https://example.com",
@@ -1109,7 +1172,18 @@ func stubRepoRootForImportPath(importpath string, verbose bool) (*vcs.RepoRoot, 
 		}, nil
 	}
 
-	return nil, fmt.Errorf("could not resolve import path: %q", importpath)
+	return nil, fmt.Errorf("could not resolve import path: %q", importPath)
+}
+
+// stubModInfo is a stub implementation of RemoteCache.ModInfo.
+func stubModInfo(importPath string) (string, error) {
+	if pathtools.HasPrefix(importPath, "example.com/repo/v2") {
+		return "example.com/repo/v2", nil
+	}
+	if pathtools.HasPrefix(importPath, "example.com/repo") {
+		return "example.com/repo", nil
+	}
+	return "", fmt.Errorf("could not find module for import path: %q", importPath)
 }
 
 func convertImportsAttr(r *rule.Rule) interface{} {
@@ -1122,4 +1196,10 @@ func convertImportsAttr(r *rule.Rule) interface{} {
 		// proto_library
 		return value
 	}
+}
+
+type mapResolver map[string]resolve.Resolver
+
+func (mr mapResolver) Resolver(r *rule.Rule, f string) resolve.Resolver {
+	return mr[r.Kind()]
 }

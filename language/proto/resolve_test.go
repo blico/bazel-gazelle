@@ -253,11 +253,130 @@ proto_library(
     deps = ["//foo/bar:bar_proto"],
 )
 `,
+		}, {
+			desc: "strip_import_prefix",
+			index: []buildFile{{
+				rel: "",
+				content: `
+# gazelle:proto_strip_import_prefix /foo/bar/
+`,
+			}, {
+				rel: "foo/bar/sub",
+				content: `
+proto_library(
+    name = "foo_proto",
+    srcs = ["foo.proto"],
+)
+`,
+			},
+			},
+			old: `
+proto_library(
+    name = "dep_proto",
+    _imports = ["sub/foo.proto"],
+)
+`,
+			want: `
+proto_library(
+    name = "dep_proto",
+    deps = ["//foo/bar/sub:foo_proto"],
+)
+`,
+		}, {
+			desc: "skip bad strip_import_prefix",
+			index: []buildFile{{
+				rel: "",
+				content: `
+# gazelle:proto_strip_import_prefix /foo
+`,
+			}, {
+				rel: "bar",
+				content: `
+proto_library(
+    name = "foo_proto",
+    srcs = ["foo.proto"],
+)
+`,
+			},
+			},
+			old: `
+proto_library(
+    name = "dep_proto",
+    _imports = ["bar/foo.proto"],
+)
+`,
+			want: `
+proto_library(
+    name = "dep_proto",
+    deps = ["//bar:bar_proto"],
+)
+`,
+		}, {
+			desc: "import_prefix",
+			index: []buildFile{{
+				rel: "",
+				content: `
+# gazelle:proto_import_prefix foo/
+`,
+			}, {
+				rel: "bar",
+				content: `
+proto_library(
+    name = "foo_proto",
+    srcs = ["foo.proto"],
+)
+`,
+			},
+			},
+			old: `
+proto_library(
+    name = "dep_proto",
+    _imports = ["foo/bar/foo.proto"],
+)
+`,
+			want: `
+proto_library(
+    name = "dep_proto",
+    deps = ["//bar:foo_proto"],
+)
+`,
+		}, {
+			desc: "strip_import_prefix and import_prefix",
+			index: []buildFile{{
+				rel: "",
+				content: `
+# gazelle:proto_strip_import_prefix /foo
+# gazelle:proto_import_prefix bar/
+`,
+			}, {
+				rel: "foo",
+				content: `
+proto_library(
+    name = "foo_proto",
+    srcs = ["foo.proto"],
+)
+`,
+			},
+			},
+			old: `
+proto_library(
+    name = "dep_proto",
+    _imports = ["bar/foo.proto"],
+)
+`,
+			want: `
+proto_library(
+    name = "dep_proto",
+    deps = ["//foo:foo_proto"],
+)
+`,
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			c, lang, cexts := testConfig(t, "testdata")
-			ix := resolve.NewRuleIndex(map[string]resolve.Resolver{"proto_library": lang})
+			mrslv := make(mapResolver)
+			mrslv["proto_library"] = lang
+			ix := resolve.NewRuleIndex(mrslv.Resolver)
 			rc := (*repo.RemoteCache)(nil)
 			for _, bf := range tc.index {
 				f, err := rule.LoadData(filepath.Join(bf.rel, "BUILD.bazel"), bf.rel, []byte(bf.content))
@@ -303,4 +422,10 @@ func convertImportsAttr(r *rule.Rule) interface{} {
 	}
 	r.DelAttr("_imports")
 	return value
+}
+
+type mapResolver map[string]resolve.Resolver
+
+func (mr mapResolver) Resolver(r *rule.Rule, f string) resolve.Resolver {
+	return mr[r.Kind()]
 }

@@ -2,11 +2,10 @@ module github.com/bazelbuild/bazel-gazelle
 
 require (
 	github.com/BurntSushi/toml v0.3.1 // indirect
-	github.com/bazelbuild/buildtools v0.0.0-20190122172533-1f3678932acd
+	github.com/bazelbuild/buildtools v0.0.0-20190329162354-3f7be923c4b0
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.4.7
 	github.com/kr/pretty v0.1.0 // indirect
-	github.com/kr/pty v1.1.3 // indirect
 	github.com/pelletier/go-toml v1.2.0
 	github.com/pmezard/go-difflib v1.0.0
 	golang.org/x/sys v0.0.0-20190122071731-054c452bb702 // indirect
